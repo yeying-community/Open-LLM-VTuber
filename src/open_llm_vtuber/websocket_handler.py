@@ -69,6 +69,7 @@ class WebSocketHandler:
         self.current_conversation_tasks: Dict[str, Optional[asyncio.Task]] = {}
         self.default_context_cache = default_context_cache
         self.received_data_buffers: Dict[str, np.ndarray] = {}
+        self.manual_segment_buffers: Dict[str, Dict[str, np.ndarray]] = {}
 
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
@@ -95,6 +96,8 @@ class WebSocketHandler:
             "audio-play-start": self._handle_audio_play_start,
             "request-init-config": self._handle_init_config_request,
             "heartbeat": self._handle_heartbeat,
+            "manual-segment-chunk": self._handle_manual_segment_chunk,
+            "manual-segment-end": self._handle_manual_segment_end,
         }
 
     async def handle_new_connection(
@@ -142,6 +145,7 @@ class WebSocketHandler:
         self.client_connections[client_uid] = websocket
         self.client_contexts[client_uid] = session_service_context
         self.received_data_buffers[client_uid] = np.array([])
+        self.manual_segment_buffers[client_uid] = {}
 
         self.chat_group_manager.client_group_map[client_uid] = ""
         await self.send_group_update(websocket, client_uid)
@@ -485,6 +489,71 @@ class WebSocketHandler:
                 self.received_data_buffers[client_uid],
                 np.array(audio_data, dtype=np.float32),
             )
+
+    async def _handle_manual_segment_chunk(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Handle manual transcription audio chunks"""
+        segment_id = data.get("segment_id")
+        chunk = data.get("audio", [])
+        if not segment_id:
+            logger.warning(f"[manual-segment] Received chunk without segment_id (client={client_uid})")
+            return
+        if not chunk:
+            logger.debug(f"[manual-segment] Received empty audio chunk for segment {segment_id}")
+            return
+
+        segment_buffers = self.manual_segment_buffers.setdefault(client_uid, {})
+        chunk_array = np.array(chunk, dtype=np.float32)
+        existing = segment_buffers.get(segment_id)
+        if existing is None or existing.size == 0:
+            segment_buffers[segment_id] = chunk_array
+        else:
+            segment_buffers[segment_id] = np.append(existing, chunk_array)
+        total_samples = segment_buffers[segment_id].size
+        logger.debug(
+            "[manual-segment] Chunk received "
+            f"(segment={segment_id}, client={client_uid}, "
+            f"chunk_samples={len(chunk_array)}, total_samples={int(total_samples)})"
+        )
+
+    async def _handle_manual_segment_end(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Finalize a manual transcription segment"""
+        segment_id = data.get("segment_id")
+        if not segment_id:
+            logger.warning(f"[manual-segment] Segment end without segment_id (client={client_uid})")
+            return
+
+        segment_buffers = self.manual_segment_buffers.setdefault(client_uid, {})
+        audio_buffer = segment_buffers.pop(segment_id, np.array([]))
+        if audio_buffer.size == 0:
+            logger.warning(f"[manual-segment] Segment end without buffered audio (segment={segment_id})")
+            return
+
+        context = self.client_contexts[client_uid]
+        logger.info(
+            f"[manual-segment] Transcribing segment {segment_id} for {client_uid} "
+            f"(samples={int(audio_buffer.size)})"
+        )
+        try:
+            transcription = await context.asr_engine.async_transcribe_np(audio_buffer)
+        except Exception as exc:
+            logger.error(f"Error transcribing manual segment {segment_id}: {exc}")
+            return
+
+        preview = (transcription or "")[:80]
+        logger.info(
+            f"[manual-segment] Transcription complete for segment {segment_id}: {preview!r}"
+        )
+        payload = {
+            "type": "user-input-transcription",
+            "text": transcription,
+            "segment_id": segment_id,
+            "manual": True,
+        }
+        await websocket.send_text(json.dumps(payload))
 
     async def _handle_raw_audio_data(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
