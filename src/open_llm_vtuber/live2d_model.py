@@ -1,5 +1,6 @@
 import json
 import chardet
+from urllib.parse import urlparse
 from loguru import logger
 
 # This class will only prepare the payload for the live2d model
@@ -81,6 +82,17 @@ class Live2dModel:
 
         raise UnicodeError(f"Failed to decode {file_path} with any encoding")
 
+    def _normalize_resource_path(self, value):
+        if not value or not isinstance(value, str):
+            return value
+        if value.startswith("/"):
+            return value
+        parsed = urlparse(value)
+        if parsed.scheme and parsed.netloc:
+            normalized_path = parsed.path or "/"
+            return normalized_path if normalized_path.startswith("/") else "/" + normalized_path
+        return value
+
     def _lookup_model_info(self, model_name: str) -> dict:
         """
         Find the model information from the model dictionary and return the information about the matched model.
@@ -141,7 +153,12 @@ class Live2dModel:
 
         logger.info("Model Information Loaded.")
 
-        return matched_model
+        normalized_model = dict(matched_model)
+        normalized_model["url"] = self._normalize_resource_path(normalized_model.get("url"))
+        resource_path = normalized_model.get("resourcePath")
+        if isinstance(resource_path, str):
+            normalized_model["resourcePath"] = self._normalize_resource_path(resource_path)
+        return normalized_model
 
     def extract_emotion(self, str_to_check: str) -> list:
         """
